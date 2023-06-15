@@ -1,0 +1,101 @@
+version: 2.1
+
+parameters:
+  cluster-region:
+    type: string
+    default: "us-west-2"
+  cluster-ns:
+    type: string
+    default: "cci3-vijay"
+  cluster-name:
+    type: string
+    default: "vijay-us-west-cluster"
+  velero-version:
+    type: string
+    default: "v1.8.0"
+  s3-bucket:
+    type: string
+    default: "vijay-v3-velero"
+
+commands:
+  install-prereqs:
+      steps:
+         - run:
+             name: Install Prerequisites
+             command: |
+                 curl -fsSL -o k8s-init.sh https://raw.githubusercontent.com/vjpandian/urban-bassoon/main/install-k8s-prerequisites.sh
+                 chmod 700 k8s-init.sh
+                 ./k8s-init.sh
+                 if [ ! -f ~/.aws/credentials ]; then echo "Credentials file not found!" exit 1; else echo "Credentials file found..will proceed"; fi
+  
+  download-velero: 
+      steps:   
+         - run: 
+             name: Download Velero from their GitHub Releases page
+             command: | 
+                   curl -fsSL -o velero-<< pipeline.parameters.velero-version >>-linux-amd64.tar.gz https://github.com/vmware-tanzu/velero/releases/download/<< pipeline.parameters.velero-version >>/velero-<< pipeline.parameters.velero-version >>-linux-amd64.tar.gz
+                   tar xvf velero-<< pipeline.parameters.velero-version >>-linux-amd64.tar.gz
+                   ls -lah
+                   cd velero-<< pipeline.parameters.velero-version >>-linux-amd64
+                   cp /home/circleci/.aws/credentials /home/circleci/.aws/credentials-velero
+                   sudo cp /home/circleci/project/velero-<< pipeline.parameters.velero-version >>-linux-amd64/velero /usr/local/bin
+  
+  install-velero:
+      steps:
+         - run: 
+             name: install velero
+             no_output_timeout: 15m
+             command: |
+                   cd /home/circleci/project/velero-<< pipeline.parameters.velero-version >>-linux-amd64
+                   ./velero install \
+                     --provider aws \
+                     --plugins velero/velero-plugin-for-aws:v1.2.0 \
+                     --bucket << pipeline.parameters.s3-bucket >> \
+                     --backup-location-config region=<< pipeline.parameters.cluster-region >> \
+                     --snapshot-location-config region=<< pipeline.parameters.cluster-region >> \
+                     --secret-file /home/circleci/.aws/credentials-velero \
+                     --use-restic \
+                     --wait
+  
+  take-velero-backup:
+      steps:
+        - run: 
+            name: take velero backups
+            no_output_timeout: 15m
+            command: |
+                cd /home/circleci/project/velero-<< pipeline.parameters.velero-version >>-linux-amd64
+                velero backup create << pipeline.parameters.cluster-ns >>-$CIRCLE_BUILD_NUM --include-namespaces << pipeline.parameters.cluster-ns >> --labels chart--rev=$CIRCLE_WORKFLOW_ID
+
+  
+
+jobs:
+  velero-backup-v3:
+    machine: true
+    resource_class: xlarge
+    environment:
+       AWS_DEFAULT_REGION: << pipeline.parameters.cluster-region >>
+    steps:
+      - checkout
+      - install-prereqs
+      - run:
+          name: Write Kubeconfig to v3 cluster
+          command: |
+              eksctl utils write-kubeconfig --cluster=<< pipeline.parameters.cluster-name >>
+      - run:
+          name: Get cluster and pod info
+          command: |
+              eksctl get clusters 
+              kubectl get pods -n << pipeline.parameters.cluster-ns >>
+      - run: 
+          name: Install Restic
+          command: sudo apt-get install restic
+      - download-velero
+      - install-velero
+      - take-velero-backup
+
+
+workflows:
+  main:
+    jobs:
+      - velero-backup-v3:
+           context: org-global
